@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import THEMES from "./themes.js";
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
@@ -35,6 +35,53 @@ const loadDefaults = () => {
 const loadQueue  = () => { try { const s = localStorage.getItem("robocopy_queue");  return s ? JSON.parse(s) : []; } catch { return []; } };
 const loadTheme  = () => { try { return localStorage.getItem("robocopy_theme") || "dark"; } catch { return "dark"; } };
 
+// ─── Security helpers ─────────────────────────────────────────────────────────
+
+// Allowlist of extra robocopy flags the user may type in the Extra Params field.
+// Each entry is a regex that matches exactly one valid flag token.
+// SECURITY: anything not matching this list is silently dropped so a
+// compromised localStorage entry cannot inject arbitrary flags.
+const ALLOWED_EXTRA_FLAGS = [
+  /^\/NP$/i,   // no progress
+  /^\/NFL$/i,  // no file list
+  /^\/NDL$/i,  // no directory list
+  /^\/NS$/i,   // no file sizes
+  /^\/NC$/i,   // no file classes
+  /^\/NJH$/i,  // no job header
+  /^\/NJS$/i,  // no job summary
+  /^\/XX$/i,   // exclude extra files
+  /^\/XJD$/i,  // exclude junction directories
+  /^\/COMPRESS$/i, // network compression
+  /^\/256$/i,  // allow very long paths
+  /^\/TEE$/i,  // output to log and console
+  /^\/ETA$/i,  // estimated time of arrival
+];
+
+// Sanitise a raw extraParams string: split on whitespace, keep only allowlisted tokens.
+function sanitiseExtraParams(raw) {
+  if (!raw || !raw.trim()) return [];
+  return raw.trim().split(/\s+/).filter(p => p && ALLOWED_EXTRA_FLAGS.some(re => re.test(p)));
+}
+
+// Clamp a numeric string to [min, max] and return a safe integer string.
+// SECURITY FIX #11: prevents arbitrarily large or malformed numeric args.
+function clampInt(val, min, max) {
+  const n = parseInt(val, 10);
+  if (isNaN(n)) return String(min);
+  return String(Math.max(min, Math.min(max, n)));
+}
+
+// Validate a Windows path on the renderer side before sending to main process.
+// SECURITY FIX #3: reject null bytes, UNC paths, and traversal sequences.
+// The main process must perform its own authoritative check; this is a first layer.
+function validatePath(raw) {
+  if (!raw || typeof raw !== "string") return false;
+  if (/[\x00]/.test(raw)) return false;          // null bytes
+  if (/\.\.[\\/]/.test(raw)) return false;       // traversal
+  if (/^\\\\/.test(raw)) return false;           // UNC paths
+  return true;
+}
+
 // ─── Command builder ─────────────────────────────────────────────────────────
 // buildArgs: returns a plain string[] for spawn() — no quoting needed, paths
 //            with spaces are handled safely by Node's argv passing.
@@ -51,22 +98,23 @@ function buildArgs(s) {
   const args = [src, dst];
   if (s.whatToCopy === "S") args.push("/S");
   else if (s.whatToCopy === "E") args.push("/E");
-  else if (s.whatToCopy === "LEV") args.push("/LEV:" + s.levN);
+  else if (s.whatToCopy === "LEV") args.push("/LEV:" + clampInt(s.levN, 1, 128));
   if (s.copyMethod === "MOV")        args.push("/MOV");
   else if (s.copyMethod === "MOVE")  args.push("/MOVE");
   else if (s.copyMethod === "PURGE") args.push("/PURGE");
   const flags = [s.copyD&&"D",s.copyS&&"S",s.copyA&&"A",s.copyT&&"T",s.copyO&&"O",s.copyU&&"U"].filter(Boolean).join("");
   if (flags) args.push("/COPY:" + flags);
-  if (s.retries)  args.push("/R:" + s.retries);
-  if (s.waitTime) args.push("/W:" + s.waitTime);
+  // SECURITY FIX #11: clamp retries to 0–999 and wait to 0–999 seconds
+  if (s.retries)  args.push("/R:" + clampInt(s.retries,  0, 999));
+  if (s.waitTime) args.push("/W:" + clampInt(s.waitTime, 0, 999));
   if (s.copyMode === "Z")       args.push("/Z");
   else if (s.copyMode === "ZB") args.push("/ZB");
   else if (s.copyMode === "B")  args.push("/B");
-  if (s.useThreads && s.threads) args.push("/MT:" + s.threads);
-  // Split extra params on whitespace so each flag is its own argv element
-  if (s.extraParams.trim()) {
-    s.extraParams.trim().split(/\s+/).forEach(p => { if (p) args.push(p); });
-  }
+  // SECURITY FIX #11: clamp threads to 1–128
+  if (s.useThreads && s.threads) args.push("/MT:" + clampInt(s.threads, 1, 128));
+  // SECURITY FIX #1: only allowlisted extra flags are appended
+  sanitiseExtraParams(s.extraParams).forEach(p => args.push(p));
+  // SECURITY FIX #2: log path is always derived from the validated dst; never user-supplied verbatim
   if (s.logToFile) args.push("/LOG:" + dst + "\\robocopy.log");
   return args;
 }
@@ -81,10 +129,10 @@ function buildCommand(s) {
 }
 
 // ─── CSS ──────────────────────────────────────────────────────────────────────
-const FONTS = `@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@400;500;600;700&display=swap');`;
-
+// NOTE: Google Fonts are loaded via <link> in index.html (FIX #8).
+// BASE_CSS is injected once into the document head by a useEffect in App(),
+// not re-rendered as a <style> tag on every state change.
 const BASE_CSS = `
-  ${FONTS}
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
   html,body,#root{height:100%;width:100%;background:var(--app-bg);overflow:hidden;}
 
@@ -442,6 +490,12 @@ function CheckItem({ active, onClick, alwaysOn, children }) {
 
 
 // ─── FileBrowser component ────────────────────────────────────────────────────
+// FIX #9: imgExts hoisted to module level — created once, never re-allocated per render.
+const IMG_EXTS = new Set([".png",".jpg",".jpeg",".gif",".webp",".bmp",".ico",".svg"]);
+
+// Max thumbnails to keep in each component's cache before evicting oldest entries.
+const THUMB_CACHE_LIMIT = 200;
+
 function formatSize(bytes) {
   if (bytes === null) return "";
   if (bytes < 1024) return bytes + " B";
@@ -623,22 +677,35 @@ function PreviewPane({ selected, currentPath }) {
 // Renders entries as image thumbnails (for images) or icon tiles (for everything else).
 // thumbSize = pixel width/height of each thumbnail cell.
 function ThumbnailGrid({ entries, currentPath, selected, onSelect, onNavigate, thumbSize }) {
-  const imgExts = new Set([".png",".jpg",".jpeg",".gif",".webp",".bmp",".ico",".svg"]);
-  const [thumbCache, setThumbCache] = useState({});  // path -> base64
+  // FIX #5 & #9: uses module-level IMG_EXTS constant; cache evicted on navigation
+  // and capped at THUMB_CACHE_LIMIT entries to prevent memory exhaustion.
+  const [thumbCache, setThumbCache] = useState({});
+
+  // FIX #5: clear cache whenever the user navigates to a different folder
+  useEffect(() => {
+    setThumbCache({});
+  }, [currentPath]);
 
   // Load image thumbnails on demand
   useEffect(() => {
     const toLoad = entries.filter(e => {
       if (e.isDir) return false;
       const ext = e.name.includes(".") ? "." + e.name.split(".").pop().toLowerCase() : "";
-      return imgExts.has(ext);
+      return IMG_EXTS.has(ext);
     });
     toLoad.forEach(e => {
       const full = currentPath.replace(/[/\\]+$/, "") + "\\" + e.name;
       if (thumbCache[full]) return;
       window.electronAPI?.previewFile(full).then(p => {
         if (p?.type === "image") {
-          setThumbCache(prev => ({ ...prev, [full]: `data:${p.mime};base64,${p.data}` }));
+          setThumbCache(prev => {
+            const keys = Object.keys(prev);
+            // FIX #5: evict oldest entries when over the limit
+            const trimmed = keys.length >= THUMB_CACHE_LIMIT
+              ? Object.fromEntries(keys.slice(-THUMB_CACHE_LIMIT + 1).map(k => [k, prev[k]]))
+              : prev;
+            return { ...trimmed, [full]: `data:${p.mime};base64,${p.data}` };
+          });
         }
       }).catch(() => {});
     });
@@ -650,7 +717,7 @@ function ThumbnailGrid({ entries, currentPath, selected, onSelect, onNavigate, t
         const full = currentPath.replace(/[/\\]+$/, "") + "\\" + entry.name;
         const ext  = entry.name.includes(".") ? "." + entry.name.split(".").pop().toLowerCase() : "";
         const isSel = selected?.fullPath === full;
-        const isImg = imgExts.has(ext);
+        const isImg = IMG_EXTS.has(ext);
         const thumb = thumbCache[full];
 
         return (
@@ -679,20 +746,31 @@ function ThumbnailGrid({ entries, currentPath, selected, onSelect, onNavigate, t
 
 // ─── TileList component (compact rows with small thumbnail) ───────────────────
 function TileList({ entries, currentPath, selected, onSelect, onNavigate }) {
-  const imgExts = new Set([".png",".jpg",".jpeg",".gif",".webp",".bmp",".ico",".svg"]);
+  // FIX #5 & #9: uses module-level IMG_EXTS constant; cache evicted on navigation
   const [thumbCache, setThumbCache] = useState({});
   const TILE = 32;
+
+  // FIX #5: clear cache whenever the user navigates to a different folder
+  useEffect(() => {
+    setThumbCache({});
+  }, [currentPath]);
 
   useEffect(() => {
     entries.filter(e => {
       const ext = e.name.includes(".") ? "." + e.name.split(".").pop().toLowerCase() : "";
-      return !e.isDir && imgExts.has(ext);
+      return !e.isDir && IMG_EXTS.has(ext);
     }).forEach(e => {
       const full = currentPath.replace(/[/\\]+$/, "") + "\\" + e.name;
       if (thumbCache[full]) return;
       window.electronAPI?.previewFile(full).then(p => {
         if (p?.type === "image")
-          setThumbCache(prev => ({ ...prev, [full]: `data:${p.mime};base64,${p.data}` }));
+          setThumbCache(prev => {
+            const keys = Object.keys(prev);
+            const trimmed = keys.length >= THUMB_CACHE_LIMIT
+              ? Object.fromEntries(keys.slice(-THUMB_CACHE_LIMIT + 1).map(k => [k, prev[k]]))
+              : prev;
+            return { ...trimmed, [full]: `data:${p.mime};base64,${p.data}` };
+          });
       }).catch(() => {});
     });
   }, [currentPath, entries]);
@@ -704,7 +782,7 @@ function TileList({ entries, currentPath, selected, onSelect, onNavigate }) {
         const ext   = entry.name.includes(".") ? "." + entry.name.split(".").pop().toLowerCase() : "";
         const isSel = selected?.fullPath === full;
         const thumb = thumbCache[full];
-        const isImg = imgExts.has(ext);
+        const isImg = IMG_EXTS.has(ext);
 
         return (
           <div key={entry.name}
@@ -778,14 +856,15 @@ function FileBrowser({ onSelect, onCancel, title = "Select Folder or File" }) {
     if (listRef.current) listRef.current.scrollTop = 0;
   }, [currentPath]);
 
-  const sorted = [...entries].sort((a, b) => {
+  // FIX #7: memoised sort — only recomputes when entries, sortBy, or sortAsc change.
+  const sorted = useMemo(() => [...entries].sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
     let cmp = 0;
     if (sortBy === "name") cmp = a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
     else if (sortBy === "size") cmp = (a.size || 0) - (b.size || 0);
     else if (sortBy === "date") cmp = (a.modified || "").localeCompare(b.modified || "");
     return sortAsc ? cmp : -cmp;
-  });
+  }), [entries, sortBy, sortAsc]);
 
   const handleSort = (col) => {
     if (sortBy === col) setSortAsc(a => !a); else { setSortBy(col); setSortAsc(true); }
@@ -829,6 +908,18 @@ function FileBrowser({ onSelect, onCancel, title = "Select Folder or File" }) {
   const sortArrow = (col) => sortBy === col ? (sortAsc ? " ▲" : " ▼") : "";
 
   // ── Draggable divider logic ───────────────────────────────────────────────
+  // FIX #6: listener refs stored so they can be removed on unmount if a drag
+  // is in progress when the modal closes (e.g. Escape key mid-drag).
+  const dragListeners = useRef({ move: null, up: null });
+
+  useEffect(() => {
+    return () => {
+      // Cleanup: remove any dangling window listeners left from an in-progress drag
+      if (dragListeners.current.move) window.removeEventListener("mousemove", dragListeners.current.move);
+      if (dragListeners.current.up)   window.removeEventListener("mouseup",   dragListeners.current.up);
+    };
+  }, []);
+
   const startDrag = useCallback((e, which) => {
     e.preventDefault();
     e.stopPropagation();
@@ -848,8 +939,12 @@ function FileBrowser({ onSelect, onCancel, title = "Select Folder or File" }) {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dragListeners.current.move = null;
+      dragListeners.current.up   = null;
       setTimeout(() => { isDragging.current = false; }, 50);
     };
+    dragListeners.current.move = onMove;
+    dragListeners.current.up   = onUp;
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, [sidebarW, previewW]);
@@ -857,6 +952,15 @@ function FileBrowser({ onSelect, onCancel, title = "Select Folder or File" }) {
   // ── Modal resize logic ────────────────────────────────────────────────────
   // isDragging ref: set true during a drag so the overlay onClick is suppressed
   const isDragging = useRef(false);
+  // FIX #6: resize listeners also stored in refs so unmount cleanup can remove them.
+  const resizeListeners = useRef({ move: null, up: null });
+
+  useEffect(() => {
+    return () => {
+      if (resizeListeners.current.move) window.removeEventListener("mousemove", resizeListeners.current.move);
+      if (resizeListeners.current.up)   window.removeEventListener("mouseup",   resizeListeners.current.up);
+    };
+  }, []);
 
   const startResize = useCallback((e) => {
     e.preventDefault();
@@ -873,9 +977,13 @@ function FileBrowser({ onSelect, onCancel, title = "Select Folder or File" }) {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      resizeListeners.current.move = null;
+      resizeListeners.current.up   = null;
       // Keep isDragging true a tick longer so the overlay click handler sees it
       setTimeout(() => { isDragging.current = false; }, 50);
     };
+    resizeListeners.current.move = onMove;
+    resizeListeners.current.up   = onUp;
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, [modalW, modalH]);
@@ -1214,6 +1322,8 @@ function ThemePickerModal({ currentTheme, onApply, onClose }) {
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
+// FIX #4: rolling cap on terminal output to prevent unbounded memory growth.
+const MAX_TERM_LINES = 2000;
 export default function App() {
   const [theme, setTheme]           = useState(loadTheme);
   const [showThemePicker, setShowThemePicker] = useState(false);
@@ -1265,16 +1375,35 @@ export default function App() {
     try { localStorage.setItem("robocopy_theme", theme); } catch {}
   }, [theme]);
 
-  // Persist queue
+  // FIX #8: inject BASE_CSS into the document once on mount instead of
+  // re-rendering a <style> tag on every state change (avoids diffing ~15 KB of CSS).
   useEffect(() => {
-    try { localStorage.setItem("robocopy_queue", JSON.stringify(queue)); } catch {}
+    const id = "robocopy-base-css";
+    if (document.getElementById(id)) return;
+    const el = document.createElement("style");
+    el.id = id;
+    el.textContent = BASE_CSS;
+    document.head.appendChild(el);
+  }, []);
+
+  // FIX #10: debounce queue persistence — only write to localStorage after
+  // 500 ms of inactivity to avoid thrashing storage on rapid mutations.
+  useEffect(() => {
+    const id = setTimeout(() => {
+      try { localStorage.setItem("robocopy_queue", JSON.stringify(queue)); } catch {}
+    }, 500);
+    return () => clearTimeout(id);
   }, [queue]);
 
   // Register output listener once
   useEffect(() => {
     if (!window.electronAPI?.onOutput) return;
     const unsub = window.electronAPI.onOutput((line) => {
-      setTermLines(prev => [...prev, line]);
+      // FIX #4: rolling cap — drop the oldest lines when over the limit
+      setTermLines(prev => {
+        const next = [...prev, line];
+        return next.length > MAX_TERM_LINES ? next.slice(next.length - MAX_TERM_LINES) : next;
+      });
     });
     return unsub;
   }, []);
@@ -1298,6 +1427,13 @@ export default function App() {
     }
     // Accept either a pre-built args array or derive from current state
     const args = Array.isArray(argsOrCmd) ? argsOrCmd : buildArgs(s);
+
+    // FIX #3: validate source and target paths before sending to main process
+    if (!validatePath(args[0]) || !validatePath(args[1])) {
+      alert("Invalid path detected. Paths must not contain null bytes, UNC addresses (\\\\), or traversal sequences (..\\ ).");
+      return;
+    }
+
     const preview = "robocopy " + args.map((a,i)=>i<2?`"${a}"`:a).join(" ");
     setTermLines([`> ${preview}`, "─".repeat(60)]);
     setShowTerminal(true);
@@ -1337,7 +1473,8 @@ export default function App() {
 
   const handleAddToQueue = () => {
     if (!s.source || !s.target) return;
-    setQueue(prev => [...prev, { id:Date.now(), ...s, label:`Job ${prev.length+1}`, scheduledTime:"", status:"queued" }]);
+    // FIX #12: use crypto.randomUUID() for collision-free job IDs
+    setQueue(prev => [...prev, { id: crypto.randomUUID(), ...s, label:`Job ${prev.length+1}`, scheduledTime:"", status:"queued" }]);
     setQueueAdded(true); setTimeout(() => setQueueAdded(false), 2000);
     setShowQueue(true);
   };
@@ -1399,7 +1536,6 @@ export default function App() {
 
   return (
     <>
-      <style>{BASE_CSS}</style>
       <div className="app">
         <div className="app-inner">
 
