@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RoboCopy GUI</title>
+    <!--
+      FIX #8 (bonus): Google Fonts moved from the BASE_CSS JS string into the
+      HTML head. This ensures fonts load independently of React's render cycle
+      and eliminates the @import inside a dynamically-injected <style> tag,
+      which some browsers handle less efficiently than a top-level <link>.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet" />
   </head>
   <body>
     <div id="root"></div>
