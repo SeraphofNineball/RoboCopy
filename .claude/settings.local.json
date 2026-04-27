@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(mkdir -p \"C:\\\\Users\\\\flclk\\\\Documents\\\\Projects\")",
-      "Bash(cp -r \"C:\\\\Users\\\\flclk\\\\Downloads\\\\robocopy-gui-source\\(1\\)\\\\robocopy-gui\" \"C:\\\\Users\\\\flclk\\\\Documents\\\\Projects\\\\robocopy-gui\")"
-    ]
-  }
-}
