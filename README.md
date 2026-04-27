@@ -1,3 +1,5 @@
+#AI Use Notification!! This tool was "vibecoded" with Claude AI/Code. This was something I wanted for myself and decicded to share it for anyone that has an intrest. Im work in cyber security, im not a programmer by trade.
+
 # RoboCopy GUI - Build Instructions
 
 ## Prerequisites
