@@ -1,4 +1,4 @@
-#AI Use Notification!! This tool was "vibecoded" with Claude AI/Code. This was something I wanted for myself and decicded to share it for anyone that has an intrest. Im work in cyber security, im not a programmer by trade.
+#AI Use Notification!! This tool was "vibecoded" with Claude AI/Code. This was something I wanted for myself and decided to share it for anyone that has an interest. I work in cyber security, i'm not a programmer by trade.
 
 
 RoboCopy is a GUI wrapper for the built-in Windows CLI tool.
